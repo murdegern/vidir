@@ -16,11 +16,15 @@ use File::Path ();
 use Getopt::Long;
 use Pod::Usage;
 
-my($error, $opt_verbose, $opt_sort) = (0, 0, 0);
+my($error, $opt_verbose, $opt_sort, $opt_git) = (0, 0, 0, 0);
 
+if( defined $ENV{VIDIR_DEFAULT_OPTIONS} && length $ENV{VIDIR_DEFAULT_OPTIONS} ) {
+  unshift @ARGV, (split /\s+/, $ENV{VIDIR_DEFAULT_OPTIONS});
+}
 
 GetOptions(
   's|sort'    => \$opt_sort,
+  'g|git'     => \$opt_git,
   'v|verbose' => \$opt_verbose,
   'h|help'    => sub { pod2usage(verbose => 1) },
 );
@@ -28,15 +32,16 @@ GetOptions(
 my(@files, @directories, @sorted);
 @ARGV = @ARGV > 0 ? @ARGV : './';
 
+
 for my $item(@ARGV) {
   if($item eq '-') {
     push(@files, map { chomp; $_ } <STDIN>);
-    close STDIN or die "Cant close STDIN: $!\n";
-    open(STDIN, '/dev/tty') or die "Cant reopen STDIN: $!\n";
+    close STDIN or die "Can't close STDIN: $!\n";
+    open(STDIN, '/dev/tty') or die "Can't reopen STDIN: $!\n";
     next;
   }
   if(-d $item) {
-    opendir(my $dh, $item) or die "Cant opendir $item: $!\n";
+    opendir(my $dh, $item) or die "Can't opendir $item: $!\n";
     for(sort grep { ! /\A[.]{1,2}\Z/ } readdir($dh)) {
       $item =~ s{/$}{};
       if(-d "$item/$_") {
@@ -46,7 +51,7 @@ for my $item(@ARGV) {
         push(@files, "$item/$_");
       }
     }
-    closedir $dh or die "Cant close dirhandle $item: $!\n";
+    closedir $dh or die "Can't close dirhandle $item: $!\n";
   }
 }
 
@@ -96,6 +101,63 @@ else {
   system(@editor,  $tmp);
 }
 
+my %gitcache;
+
+sub is_git {
+  my ($file) = @_;
+  (my $check = File::Spec->rel2abs($file)) =~ s,//+,/,g;
+  $check =~ s,/$,,;
+  return $gitcache{$check} if exists $gitcache{$check};
+
+  my @inter = ($check);
+
+  # remove last component first (a dir with .git/ in it is not git controlled)
+  for(;;) {
+    $check =~ s,/[^/]+$,,;
+
+    unless( length $check ) {
+      $gitcache{$_} = 0 for (@inter);
+      return 0;
+    }
+    push @inter, $check;
+
+    if( -d "$check/.git" || $gitcache{$check} ) {
+      $gitcache{$_} = 1 for (@inter);
+      return 1;
+    }
+
+    if( exists $gitcache{$check} ) {
+      $gitcache{$_} = 0 for (@inter);
+      return 0;
+    }
+  }
+}
+
+sub do_copy {
+  my ($src, $dst) = @_;
+
+  # must copy in the "git" case, too
+  return 0 unless copy($src, $dst);
+
+  if( $opt_git && is_git($src) && is_git($dst) ) {
+    system { 'git' } 'git', 'add', $dst;
+    return 0 if $? != 0;
+  }
+
+  return 1;
+}
+
+sub do_move {
+  my ($src, $dst) = @_;
+
+  if( $opt_git && is_git($src) && is_git($dst) ) {
+    system { 'git' } 'git', 'mv', $src, $dst;
+    return ($? == 0) ? 1 : 0;
+  }
+
+  return move($src, $dst);
+}
+
 open (IN, '<:raw', $tmp->filename) || die "$0: cannot read ".$tmp->filename.": $!\n";
 while (<IN>) {
   chomp;
@@ -125,7 +187,7 @@ while (<IN>) {
           $c++;
           $tmp=$name."~$c";
         }
-        if (! rename($name, $tmp)) {
+        if (! do_move($name, $tmp)) {
           print STDERR "$0: failed to rename $name to $tmp: $!\n";
           $error=1;
         }
@@ -140,7 +202,7 @@ while (<IN>) {
       }
 
       File::Path::make_path(dirname($name));
-      my $result=$iscopy ? copy($src, $name) : move($src, $name);
+      my $result=$iscopy ? do_copy($src, $name) : do_move($src, $name);
       if (! $result) {
         print STDERR "$0: failed to ".($iscopy ? "copy" : "rename")." $src to $name: $!\n";
         $error=1;
@@ -172,10 +234,20 @@ sub rm {
   my $file = shift;
 
   if (-d $file && ! -l $file) {
-    return File::Path::rmtree($file);
+    if( $opt_git && is_git($file) ) {
+      system { 'git' } 'git', 'rm', '-r', $file;
+      return ($? == 0) ? 1 : 0;
+    }else{
+      return File::Path::rmtree($file);
+    }
   }
   else {
-    return unlink $file;
+    if( $opt_git && is_git($file) ) {
+      system { 'git' } 'git', 'rm', $file;
+      return ($? == 0) ? 1 : 0;
+    }else{
+      return unlink $file;
+    }
   }
 }
 
